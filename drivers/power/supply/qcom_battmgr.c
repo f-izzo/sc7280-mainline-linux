@@ -105,6 +105,13 @@ enum qcom_battmgr_variant {
 #define CHARGE_CTRL_END_THR_MAX		100
 #define CHARGE_CTRL_DELTA_SOC		5
 
+#define OEM_PROPERTY_DATA_SIZE		16
+#define OEM_READ_BUF_REQ		0x10000
+#define OEM_WRITE_BUF_REQ		0x10001
+#define OEM_NOTIFY_IND			0x10002
+#define OEM_PROP_CHG_SUSPEND		12
+#define OEM_PROP_CHG_DISABLE		13
+
 struct qcom_battmgr_enable_request {
 	struct pmic_glink_hdr hdr;
 	__le32 battery_id;
@@ -144,6 +151,13 @@ struct qcom_battmgr_charge_ctrl_request {
 	__le32 enable;
 	__le32 target_soc;
 	__le32 delta_soc;
+};
+
+struct qcom_battmgr_oem_property_update_request {
+	struct pmic_glink_hdr hdr;
+	__le32 oem_property_id;
+	__le32 data[OEM_PROPERTY_DATA_SIZE];
+	__le32 data_size;
 };
 
 struct qcom_battmgr_message {
@@ -267,6 +281,7 @@ struct qcom_battmgr_info {
 	unsigned char day;
 	unsigned char month;
 	unsigned short year;
+	bool suspended;
 };
 
 struct qcom_battmgr_status {
@@ -422,6 +437,21 @@ static int qcom_battmgr_update_discharge_time(struct qcom_battmgr *battmgr)
 		.battery_id = cpu_to_le32(0),
 		.rate = cpu_to_le32(0),
 	};
+
+	return qcom_battmgr_request(battmgr, &request, sizeof(request));
+}
+
+static int qcom_battmgr_write_oem_property(struct qcom_battmgr *battmgr,
+					   int property, void* data, size_t len)
+{
+	struct qcom_battmgr_oem_property_update_request request = {
+		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_OEM_MOTOROLA),
+		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
+		.hdr.opcode = cpu_to_le32(OEM_WRITE_BUF_REQ),
+		.oem_property_id = cpu_to_le32(property),
+		.data_size = cpu_to_le32(len)
+	};
+	memcpy(request.data, data, len);
 
 	return qcom_battmgr_request(battmgr, &request, sizeof(request));
 }
@@ -652,6 +682,11 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_SERIAL_NUMBER:
 		val->strval = battmgr->info.serial_number;
 		break;
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		val->intval = battmgr->info.suspended ?
+			POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE :
+			POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -672,6 +707,14 @@ static int qcom_battmgr_set_charge_control(struct qcom_battmgr *battmgr,
 	};
 
 	return qcom_battmgr_request(battmgr, &request, sizeof(request));
+}
+
+static int qcom_battmgr_charge_suspend(struct qcom_battmgr *battmgr, bool enable)
+{
+	pr_err("NURA_DEBUG: Setting OEM_PROP_CHG_SUSPEND to %d\n", enable);
+	battmgr->info.suspended = enable;
+	return qcom_battmgr_write_oem_property(battmgr, OEM_PROP_CHG_SUSPEND,
+				       &enable, sizeof(enable));
 }
 
 static int qcom_battmgr_set_charge_start_threshold(struct qcom_battmgr *battmgr, int start_soc)
@@ -763,6 +806,7 @@ static int qcom_battmgr_bat_is_writeable(struct power_supply *psy,
 	switch (psp) {
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
 		return 1;
 	default:
 		return 0;
@@ -785,6 +829,12 @@ static int qcom_battmgr_bat_set_property(struct power_supply *psy,
 		return qcom_battmgr_set_charge_start_threshold(battmgr, pval->intval);
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
 		return qcom_battmgr_set_charge_end_threshold(battmgr, pval->intval);
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		if (pval->intval == POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO)
+			return qcom_battmgr_charge_suspend(battmgr, false);
+		else
+			return qcom_battmgr_charge_suspend(battmgr, true);
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -885,6 +935,7 @@ static const enum power_supply_property sm8350_bat_props[] = {
 	POWER_SUPPLY_PROP_INTERNAL_RESISTANCE,
 	POWER_SUPPLY_PROP_STATE_OF_HEALTH,
 	POWER_SUPPLY_PROP_POWER_NOW,
+	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
 };
 
 static const struct power_supply_desc sm8350_bat_psy_desc = {
@@ -893,6 +944,8 @@ static const struct power_supply_desc sm8350_bat_psy_desc = {
 	.properties = sm8350_bat_props,
 	.num_properties = ARRAY_SIZE(sm8350_bat_props),
 	.get_property = qcom_battmgr_bat_get_property,
+	.set_property = qcom_battmgr_bat_set_property,
+	.property_is_writeable = qcom_battmgr_bat_is_writeable,
 };
 
 static const enum power_supply_property sm8550_bat_props[] = {
